@@ -16,20 +16,7 @@ import numpy as np
 
 from strands_robots.policies.base import Policy
 
-from vla_pick import BOX_CENTER, INSTRUCTION, JOINT_KEYS, cube_diagnostics
-
-
-# Small variations that remain inside the tested top-down grasp workspace.
-DEMO_CUBE_POSITIONS = (
-    (0.000, -0.350),
-    (-0.020, -0.350),
-    (0.020, -0.350),
-    (0.000, -0.340),
-    (0.000, -0.360),
-    (-0.015, -0.340),
-    (0.015, -0.360),
-    (0.025, -0.345),
-)
+from scenarios.pick_place import JOINT_KEYS
 
 # Joint-space templates in degrees.  Position IK only makes the small
 # per-episode correction needed for the randomized cube position.
@@ -44,40 +31,6 @@ JAW_OPEN = 0.60
 JAW_CLOSE = -0.15
 
 
-def _require_success(result: dict[str, Any], operation: str) -> dict[str, Any]:
-    if result.get("status") == "success":
-        return result
-    text = " | ".join(
-        str(item.get("text"))
-        for item in result.get("content", [])
-        if isinstance(item, dict) and item.get("text")
-    )
-    raise RuntimeError(f"{operation} failed: {text or result}")
-
-
-def prepare_episode(sim: Any, cube_xy: tuple[float, float]) -> None:
-    """Reset physics, place the cube, and restore Notebook 2's start state."""
-    _require_success(sim.reset(), "reset scene")
-    _require_success(
-        sim.move_object("cube", position=[float(cube_xy[0]), float(cube_xy[1]), 0.015]),
-        "move cube",
-    )
-
-    # Same starting state used by build_scene() in vla_pick.py.  Keeping it
-    # here avoids importing a private helper while preserving exact values.
-    start_deg = np.array([14.4717, -55.7695, 54.3857, 63.2262, 85.8417])
-    lo, hi = -0.175, 1.745
-    start = np.r_[np.deg2rad(start_deg), lo + 0.093545 * (hi - lo)]
-    _require_success(
-        sim.send_action(
-            dict(zip(JOINT_KEYS, start.tolist(), strict=True)),
-            robot_name="so100",
-            n_substeps=600,
-        ),
-        "restore SO100 start pose",
-    )
-
-
 class SO100PickPlaceTeacher(Policy):
     """Ground-truth teacher: open → grasp → lift → carry → release.
 
@@ -88,6 +41,8 @@ class SO100PickPlaceTeacher(Policy):
     """
 
     def __init__(self, sim: Any, horizon: int = 20):
+        """Bind scene geometry and precompute a complete demonstration trajectory."""
+
         super().__init__()
         self.sim = sim
         self.horizon = horizon
@@ -121,25 +76,37 @@ class SO100PickPlaceTeacher(Policy):
 
     @property
     def provider_name(self) -> str:
+        """Return the provider label exposed through the Policy interface."""
+
         return "scripted-so100-teacher"
 
     @property
     def requires_images(self) -> bool:
+        """Declare that the privileged teacher does not consume camera images."""
+
         return False
 
     @property
     def execution_horizon(self) -> int:
+        """Return the maximum number of actions emitted per policy request."""
+
         return self.horizon
 
     @property
     def n_steps(self) -> int:
+        """Return the number of control steps in the generated demonstration."""
+
         return len(self.actions)
 
     def set_robot_state_keys(self, keys: list[str]) -> None:
+        """Accept the Policy hook; this teacher uses fixed SO100 joint keys."""
+
         # The teacher ignores observations; keys are fixed by the SO100.
         return None
 
     def _pinch_center(self, arm_q: np.ndarray, jaw_q: float) -> np.ndarray:
+        """Compute the world-space midpoint between the two jaw-pad geoms."""
+
         data = self._scratch
         data.qpos[:] = self.sim.mj_data.qpos
         data.qpos[:5] = arm_q
@@ -191,9 +158,13 @@ class SO100PickPlaceTeacher(Policy):
 
     @staticmethod
     def _with_jaw(arm_q: np.ndarray, jaw_q: float) -> np.ndarray:
+        """Append one jaw command to a five-joint arm configuration."""
+
         return np.r_[np.asarray(arm_q, dtype=float), float(jaw_q)]
 
     def _build_trajectory(self) -> list[dict[str, float]]:
+        """Plan all smooth joint-space phases for one pick-and-place episode."""
+
         cube = np.asarray(self.sim.mj_data.xpos[self._cube], dtype=float).copy()
 
         # These offsets reproduce the verified physical grasp: the open pads
@@ -222,6 +193,8 @@ class SO100PickPlaceTeacher(Policy):
         plan: list[dict[str, float]] = []
 
         def segment(name: str, target: np.ndarray, steps: int) -> None:
+            """Append one cosine-interpolated phase to the action plan."""
+
             nonlocal current
             start = current.copy()
             for fraction in np.linspace(0.0, 1.0, steps + 1)[1:]:
@@ -251,6 +224,8 @@ class SO100PickPlaceTeacher(Policy):
         instruction: str,
         **kwargs: Any,
     ) -> list[dict[str, float]]:
+        """Return the next precomputed action chunk and advance the trajectory cursor."""
+
         del observation, instruction, kwargs
         start = self._cursor
         stop = min(start + self.horizon, len(self.actions))
@@ -261,15 +236,4 @@ class SO100PickPlaceTeacher(Policy):
         return [self.actions[-1].copy()]
 
 
-def teacher_success(sim: Any) -> bool:
-    """Use exactly the same task metric as Notebook 2."""
-    return bool(cube_diagnostics(sim)["placed_in_box"])
-
-
-__all__ = [
-    "DEMO_CUBE_POSITIONS",
-    "INSTRUCTION",
-    "SO100PickPlaceTeacher",
-    "prepare_episode",
-    "teacher_success",
-]
+__all__ = ["SO100PickPlaceTeacher"]

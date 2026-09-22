@@ -19,6 +19,31 @@ checkpoint trained on real-camera data can fail under simulation domain shift,
 fine-tunes SmolVLA with a SageMaker Training Job, and evaluates the updated
 checkpoint under the same physical conditions.
 
+## Table of Contents
+
+- [What You Will Learn](#what-you-will-learn)
+- [Workshop Notebooks](#workshop-notebooks)
+- [Simulation Scenario Architecture](#simulation-scenario-architecture)
+  - [The `SimulationScenario` contract](#the-simulationscenario-contract)
+  - [`code/scenarios/pick_place.py`](#codescenariospick_placepy)
+  - [`code/so100_teacher.py`](#codeso100_teacherpy)
+  - [`code/vla_pick.py`](#codevla_pickpy)
+  - [Add another scenario](#add-another-scenario)
+- [Reference Configuration](#reference-configuration)
+- [Quick Start](#quick-start)
+- [The Data Contract](#the-data-contract)
+- [Which Models Are Supported?](#which-models-are-supported)
+- [Which Use Cases Can Be Covered?](#which-use-cases-can-be-covered)
+- [Which Datasets Can Be Used?](#which-datasets-can-be-used)
+- [Training Configuration](#training-configuration)
+- [Training Environments](#training-environments)
+- [SageMaker Training](#sagemaker-training)
+- [Evaluation](#evaluation)
+- [Repository Layout](#repository-layout)
+- [Common Warnings and Failures](#common-warnings-and-failures)
+- [Extending the Workshop](#extending-the-workshop)
+- [Limitations](#limitations)
+
 ## What You Will Learn
 
 - The difference between a **model** and a **policy**.
@@ -40,6 +65,470 @@ checkpoint under the same physical conditions.
 
 Run the notebooks in order. Notebook 4 deliberately reruns the baseline instead
 of assuming that a successful inference call means task success.
+
+## Simulation Scenario Architecture
+
+Simulation tasks are explicit modules under `code/scenarios/`; they are not
+inferred from filenames:
+
+```text
+code/
+├── scenarios/
+│   ├── base.py          # SimulationScenario contract
+│   ├── pick_place.py    # one concrete scenario
+│   ├── __init__.py      # explicit registry
+│   └── README.md        # template and extension guide
+├── so100_teacher.py     # teacher for the pick-place scenario
+└── vla_pick.py          # learned-policy inference over registered scenarios
+```
+
+### The `SimulationScenario` contract
+
+Every scenario declares:
+
+- a unique public `name`;
+- robot name and ordered joint keys;
+- language instruction;
+- camera names and video camera;
+- control FPS and default inference length;
+- dataset repository ID and local path;
+- `build_scene()`;
+- `prepare_episode()`, including reset and randomization;
+- `make_teacher()`;
+- `diagnostics()` and the key that represents task success.
+
+Notebook 1 selects one scenario explicitly:
+
+```python
+from scenarios import get_scenario, list_scenarios
+
+print(list_scenarios())
+scenario = get_scenario("so100_pick_place")
+```
+
+The recorder then reads all scenario-specific values from that object rather
+than hardcoding SO100, camera names, FPS, dataset path, teacher, or metric.
+
+### `code/scenarios/pick_place.py`
+
+This is the current concrete scenario. It owns:
+
+- SO100 joint ordering;
+- task instruction;
+- cube and target-box geometry;
+- `top` and `wrist` camera placement;
+- the original-checkpoint-aligned robot start pose;
+- the eight tested cube start positions;
+- episode reset/randomization;
+- `placed_in_box` diagnostics;
+- the lazy factory for `SO100PickPlaceTeacher`.
+
+Notebook 1 uses this module through the registry. `vla_pick.py` also uses it as
+the default evaluation scenario, so data collection and evaluation share the
+same scene and metric.
+
+### `code/so100_teacher.py`
+
+This module contains the privileged teacher for `so100_pick_place`. It reads
+the live MuJoCo cube pose, performs numerical IK on the jaw pads, and generates
+the smooth grasp/carry/release action trajectory.
+
+The scenario owns reset, randomization, task metadata, and success evaluation;
+the teacher owns only action generation. It is used by Notebook 1 and is not
+used by the training job or learned-policy inference.
+
+### `code/vla_pick.py`
+
+This module contains the learned-policy side:
+
+- pinned zero-shot SmolVLA checkpoint and original embodiment conversion;
+- scenario selection through the registry;
+- baseline policy loading;
+- common rollout logic;
+- compatibility exports used by Notebooks 2 and 4.
+
+It can run any registered scenario that remains compatible with the current
+SO100 checkpoint:
+
+```bash
+python code/vla_pick.py --scenario so100_pick_place
+```
+
+### Add another scenario
+
+There is no hidden naming convention. A new scenario is one explicit Python
+module, one optional teacher module, and one registry entry.
+
+#### Step 0 — Decide whether this is only a new task
+
+The current training and inference stack can be reused without structural
+changes when all of these remain true:
+
+```text
+robot:          SO100
+state/action:   six values in the existing joint order
+cameras:        top + wrist
+units:          MuJoCo radians
+control rate:   30 FPS
+policy family:  SmolVLA
+```
+
+Changing object layout, instructions, randomization, teacher motion, and
+success metric is a **new scenario**.
+
+Changing robot, number/order of joints, camera contract, units, action
+semantics, or policy family is also an **embodiment/trainer change**. Complete
+the scenario steps below, then follow Step 10 for the additional files.
+
+#### Step 1 — Create the scenario file
+
+Create:
+
+```text
+code/scenarios/my_task.py
+```
+
+Import the common contract:
+
+```python
+from typing import Any
+
+from .base import SimulationScenario
+```
+
+Define task-level constants in this file:
+
+```python
+JOINT_KEYS = (
+    "Rotation",
+    "Pitch",
+    "Elbow",
+    "Wrist_Pitch",
+    "Wrist_Roll",
+    "Jaw",
+)
+
+INSTRUCTION = "Move the red cube to the green target."
+CAMERA_NAMES = ("top", "wrist")
+```
+
+This file owns the simulation task contract. Do not put scene geometry or task
+metrics in the notebook.
+
+#### Step 2 — Implement scene construction
+
+In `code/scenarios/my_task.py`, implement:
+
+```python
+def build_scene() -> Any:
+    sim = Robot("so100", mesh=False)
+
+    sim.add_object(...)
+    sim.add_camera(name="top", ...)
+    sim.add_camera(name="wrist", ...)
+
+    # Move the robot and movable objects to the common episode start state.
+    ...
+    return sim
+```
+
+`build_scene()` must return a completely fresh simulation. Include:
+
+- robot;
+- task objects and targets;
+- static obstacles;
+- model-facing cameras;
+- deterministic initial robot pose;
+- any settling steps required before the first observation.
+
+Notebook 1 calls this through `scenario.build_scene()`. Learned-policy
+evaluation can call the same function through the registry.
+
+#### Step 3 — Implement episode reset and randomization
+
+In the same scenario file, implement:
+
+```python
+def prepare_episode(sim: Any, episode_index: int) -> dict[str, Any]:
+    sim.reset()
+
+    # Select a deterministic or seeded variation.
+    object_xy = ...
+    sim.move_object("object", position=[*object_xy, object_z])
+
+    # Restore the robot's expected start pose after reset.
+    ...
+
+    return {
+        "object_xy": object_xy,
+        "variation": episode_index,
+    }
+```
+
+This function owns the distribution from which demonstrations are collected.
+Vary only conditions the teacher can complete reliably. Useful variation
+includes:
+
+- object and target pose;
+- object appearance or shape;
+- task instruction;
+- obstacles;
+- lighting or texture;
+- small camera perturbations.
+
+The returned dictionary is metadata printed by Notebook 1; it is useful when a
+specific variation fails.
+
+#### Step 4 — Define diagnostics and physical success
+
+In the scenario file, implement:
+
+```python
+def diagnostics(sim: Any) -> dict[str, Any]:
+    object_position = ...
+    task_success = ...
+
+    return {
+        "object_position_m": object_position,
+        "task_success": bool(task_success),
+    }
+```
+
+The success value must be physical and independently measurable. Examples:
+
+| Task           | Suggested metric                                           |
+| -------------- | ---------------------------------------------------------- |
+| Pick and place | Object center inside the target volume                     |
+| Pushing        | Final XY distance below a tolerance                        |
+| Stacking       | Relative XY alignment and expected object height           |
+| Insertion      | Depth, orientation, and contact constraints                |
+| Sorting        | Every object in the target associated with its instruction |
+
+Do not use `run_policy status` as task success. That status only reports whether
+the software loop completed.
+
+The name of the boolean returned here becomes `success_key` in Step 6.
+
+#### Step 5 — Implement the scripted teacher
+
+Create a dedicated file:
+
+```text
+code/my_task_teacher.py
+```
+
+The teacher should implement the standard `Policy` interface:
+
+```python
+from strands_robots.policies.base import Policy
+
+
+class MyTaskTeacher(Policy):
+    @property
+    def provider_name(self) -> str:
+        return "scripted-my-task"
+
+    @property
+    def requires_images(self) -> bool:
+        return False
+
+    @property
+    def execution_horizon(self) -> int:
+        return 20
+
+    @property
+    def n_steps(self) -> int:
+        return len(self.actions)
+
+    def set_robot_state_keys(self, keys: list[str]) -> None:
+        return None
+
+    async def get_actions(self, observation, instruction, **kwargs):
+        ...
+        return actions
+```
+
+The teacher may use privileged simulator information such as exact object
+poses. That is acceptable for demonstration generation: the recorded VLA input
+still contains only images, robot state, and instruction.
+
+Before collecting data, test the teacher across every planned variation. Do
+not widen randomization until the teacher succeeds consistently.
+
+#### Step 6 — Connect the teacher to the scenario
+
+Back in `code/scenarios/my_task.py`, add a lazy factory:
+
+```python
+def make_teacher(sim: Any) -> Any:
+    from my_task_teacher import MyTaskTeacher
+
+    return MyTaskTeacher(sim)
+```
+
+The import is intentionally lazy. It avoids a circular import while allowing
+the teacher to import task constants from `scenarios.my_task`.
+
+#### Step 7 — Export the `SCENARIO` object
+
+At the bottom of `code/scenarios/my_task.py`, construct:
+
+```python
+SCENARIO = SimulationScenario(
+    name="my_task",
+    description="Move a red cube to a green target.",
+    robot_name="so100",
+    instruction=INSTRUCTION,
+    joint_keys=JOINT_KEYS,
+    camera_names=CAMERA_NAMES,
+    video_camera="top",
+    fps=30,
+    inference_steps=400,
+    dataset_repo_id="local/so100_my_task",
+    dataset_relative_path="datasets/so100_my_task",
+    success_key="task_success",
+    build_scene_fn=build_scene,
+    prepare_episode_fn=prepare_episode,
+    diagnostics_fn=diagnostics,
+    teacher_factory=make_teacher,
+)
+```
+
+Field ownership:
+
+| Field                                      | Used by                                        |
+| ------------------------------------------ | ---------------------------------------------- |
+| `robot_name`, `instruction`, `joint_keys`  | Recorder and policy runner                     |
+| `camera_names`, `video_camera`, `fps`      | Dataset recording and videos                   |
+| `dataset_repo_id`, `dataset_relative_path` | Notebook 1 output                              |
+| `inference_steps`                          | Learned-policy evaluation                      |
+| `success_key`                              | `scenario.is_success()`                        |
+| function fields                            | Scene, randomization, teacher, and diagnostics |
+
+#### Step 8 — Register the scenario explicitly
+
+Edit:
+
+```text
+code/scenarios/__init__.py
+```
+
+Import and register the new object:
+
+```python
+from .my_task import SCENARIO as MY_TASK
+
+register_scenario(MY_TASK)
+```
+
+There is no automatic file discovery. A missing registry entry means
+`list_scenarios()` will not show the scenario and `get_scenario("my_task")`
+will fail with the available names.
+
+#### Step 9 — Select it in Notebook 1
+
+Edit the selection cell in:
+
+```text
+01_scripted_pick.ipynb
+```
+
+Change only:
+
+```python
+SCENARIO_NAME = "my_task"
+```
+
+Notebook 1 will then obtain scene, teacher, cameras, FPS, dataset location,
+episode metadata, dimensions, diagnostics, and success from the new scenario.
+
+Start with a small smoke dataset. After validating videos, schema, episode
+boundaries, and teacher success, collect at least 50 varied successful
+demonstrations for a meaningful fine-tuning experiment.
+
+#### Step 10 — Update training only when required
+
+For a new task with the same SO100/top+wrist/6D/radians contract:
+
+1. In `03_finetune_smolvla.ipynb`, update the generated `args.yaml` values:
+   - `dataset.repo_id`;
+   - job name;
+   - dataset input path if it is not obtained from the scenario output.
+2. Keep `scripts/train.py` unchanged.
+3. Keep the SmolVLA camera mapping unchanged.
+
+If state/action dimensions, names, cameras, FPS, or units change, edit:
+
+```text
+scripts/train.py
+```
+
+Review:
+
+- `EXPECTED_STATE_NAMES`;
+- `EXPECTED_CAMERA_KEYS`;
+- `validate_dataset()`;
+- `_stage_model_for_dataset()`;
+- `state_action_units` written to the training manifest.
+
+Also edit the generated `model.camera_mapping` in
+`03_finetune_smolvla.ipynb` so dataset camera roles map to the correct source
+checkpoint camera roles.
+
+If the policy family changes from SmolVLA to ACT, Diffusion Policy, π0, GR00T,
+or another architecture, create a model-specific training adapter rather than
+adding conditionals to the SmolVLA entrypoint.
+
+#### Step 11 — Update learned-policy evaluation
+
+For another compatible scenario, select the registered scenario when calling
+the helpers in:
+
+```text
+code/vla_pick.py
+```
+
+The standalone form is:
+
+```bash
+python code/vla_pick.py --scenario my_task
+```
+
+For Notebook 4, update its scenario selection/calls so both baseline and
+fine-tuned policies use:
+
+- `build_scene("my_task")`;
+- `run_rollout(..., scenario_name="my_task")`;
+- `cube_diagnostics(..., scenario_name="my_task")`.
+
+The before/after comparison is valid only when both checkpoints see the same
+fresh scene, instruction, cameras, rollout length, and physical success metric.
+
+#### Step 12 — Validate before training
+
+Run these checks in order:
+
+1. `list_scenarios()` includes the new public name.
+2. `scenario.build_scene()` returns a fresh valid simulation.
+3. Every declared camera produces a useful image.
+4. The teacher succeeds across the complete randomization set.
+5. Every saved rollout is a separate episode.
+6. State/action names and dimensions match the selected robot.
+7. Recorded units and action semantics are documented.
+8. The zero-shot baseline is measured.
+9. The fine-tuned checkpoint is evaluated with the same scenario metric.
+
+See [`code/scenarios/README.md`](code/scenarios/README.md) for a shorter
+copyable scenario skeleton.
+
+### Module usage by notebook
+
+| Notebook                          | Scenario registry | `so100_teacher.py` | `vla_pick.py` | `scripts/train.py` |
+| --------------------------------- | :---------------: | :----------------: | :-----------: | :----------------: |
+| 1. Simulation and data collection |        Yes        |    Via scenario    |      No       |         No         |
+| 2. Zero-shot VLA baseline         | Via `vla_pick.py` |         No         |      Yes      |         No         |
+| 3. SageMaker fine-tuning          |        No         |         No         |      No       |        Yes         |
+| 4. Fine-tuned evaluation          | Via `vla_pick.py` |         No         |      Yes      |         No         |
 
 ## Reference Configuration
 
@@ -409,6 +898,11 @@ mean that the robot completed the task.
 ├── 04_evaluate_smolvla.ipynb
 ├── requirements.txt
 ├── code/
+│   ├── scenarios/
+│   │   ├── base.py
+│   │   ├── pick_place.py
+│   │   ├── __init__.py
+│   │   └── README.md
 │   ├── so100_teacher.py
 │   └── vla_pick.py
 ├── scripts/

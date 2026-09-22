@@ -16,6 +16,7 @@ venv.bak/
 # Logs
 **/logs
 *.log
+MUJOCO_LOG.TXT
 
 # OS generated files
 .DS_Store
@@ -168,3 +169,5 @@ dmypy.json
 **/dataset/
 **/datasets/
 **/outputs/
+/*.mp4
+**/*.mp4

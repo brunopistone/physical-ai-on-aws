@@ -55,12 +55,16 @@ EXPECTED_CAMERA_KEYS = {
 
 @dataclass(frozen=True)
 class ResolvedPaths:
+    """Concrete dataset, checkpoint-work, and exported-model directories."""
+
     dataset_dir: Path
     work_dir: Path
     model_dir: Path
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
+    """Load a YAML configuration file and require a top-level mapping."""
+
     if not path.is_file():
         raise FileNotFoundError(f"Training config does not exist: {path}")
     payload = yaml.safe_load(path.read_text())
@@ -70,6 +74,8 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 def _nested(config: dict[str, Any], section: str) -> dict[str, Any]:
+    """Return one mapping-valued configuration section."""
+
     value = config.get(section, {})
     if not isinstance(value, dict):
         raise TypeError(f"Config section '{section}' must be a mapping, got {type(value).__name__}")
@@ -77,6 +83,8 @@ def _nested(config: dict[str, Any], section: str) -> dict[str, Any]:
 
 
 def _first_nonempty(*values: str | os.PathLike[str] | None) -> str | None:
+    """Return the first non-empty path-like value, preserving priority order."""
+
     for value in values:
         if value is not None and str(value).strip():
             return str(value)
@@ -84,6 +92,8 @@ def _first_nonempty(*values: str | os.PathLike[str] | None) -> str | None:
 
 
 def _resolve_path(value: str, *, base_dir: Path) -> Path:
+    """Expand and resolve a path relative to the supplied project directory."""
+
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = base_dir / path
@@ -98,6 +108,8 @@ def resolve_paths(
     work_override: str | None,
     model_override: str | None,
 ) -> ResolvedPaths:
+    """Resolve portable config paths against CLI, platform environment, and YAML."""
+
     paths_cfg = _nested(config, "paths")
     project_root = config_path.resolve().parents[1]
 
@@ -149,6 +161,8 @@ def resolve_paths(
 
 
 def _dataset_info(dataset_dir: Path) -> dict[str, Any]:
+    """Read the finalized LeRobot ``meta/info.json`` object."""
+
     info_path = dataset_dir / "meta" / "info.json"
     if not info_path.is_file():
         raise FileNotFoundError(
@@ -161,6 +175,8 @@ def _dataset_info(dataset_dir: Path) -> dict[str, Any]:
 
 
 def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
+    """Validate the workshop's SO100 state, action, camera, and artifact contract."""
+
     info = _dataset_info(dataset_dir)
     features = info.get("features")
     if not isinstance(features, dict):
@@ -219,6 +235,8 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
 
 
 def _dataset_fingerprint(dataset_dir: Path) -> str:
+    """Hash the metadata files that identify the exact training dataset."""
+
     digest = hashlib.sha256()
     for relative in ("meta/info.json", "meta/stats.json", "meta/tasks.parquet"):
         path = dataset_dir / relative
@@ -230,6 +248,8 @@ def _dataset_fingerprint(dataset_dir: Path) -> str:
 
 
 def select_device(requested: str) -> str:
+    """Resolve ``auto`` to CUDA, Apple MPS, or CPU in preference order."""
+
     if requested != "auto":
         return requested
     if torch.cuda.is_available():
@@ -240,6 +260,8 @@ def select_device(requested: str) -> str:
 
 
 def _snapshot_model(model_id: str, revision: str | None) -> Path:
+    """Resolve a local checkpoint or download a pinned Hugging Face snapshot."""
+
     candidate = Path(model_id).expanduser()
     if candidate.is_dir():
         return candidate.resolve()
@@ -346,6 +368,8 @@ def _stage_model_for_dataset(
 
 
 def _bool_arg(value: bool) -> str:
+    """Render a Python boolean in the form expected by LeRobot CLI overrides."""
+
     return "true" if value else "false"
 
 
@@ -359,6 +383,8 @@ def _training_cli_args(
     batch_override: int | None,
     resume_from: str | None,
 ) -> list[str]:
+    """Translate the portable YAML configuration into native LeRobot CLI arguments."""
+
     model_cfg = _nested(config, "model")
     train_cfg = _nested(config, "training")
     data_cfg = _nested(config, "dataset")
@@ -422,6 +448,8 @@ def _training_cli_args(
 
 
 def _find_final_model(work_dir: Path) -> Path:
+    """Locate and validate the final LeRobot ``pretrained_model`` checkpoint."""
+
     last = work_dir / "checkpoints" / "last"
     if not last.exists():
         candidates = sorted((work_dir / "checkpoints").glob("[0-9]*"))
@@ -441,6 +469,8 @@ def _export_model(
     overwrite: bool,
     manifest: dict[str, Any],
 ) -> None:
+    """Copy the final checkpoint to a stable inference directory with provenance."""
+
     if destination.exists():
         if not overwrite:
             raise FileExistsError(
@@ -455,10 +485,14 @@ def _export_model(
 
 
 def _redact_cli(args: list[str]) -> list[str]:
+    """Remove token- or secret-bearing arguments before logging provenance."""
+
     return [arg for arg in args if "token" not in arg.lower() and "secret" not in arg.lower()]
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the portable wrapper CLI and its optional YAML overrides."""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Portable YAML training config.")
     parser.add_argument("--dataset-dir", help="Override dataset root.")
@@ -479,7 +513,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def train(lerobot_args: list[str]) -> None:
+    """Run LeRobot's native trainer in-process with distributed env variables intact."""
+
+    # LeRobot's Accelerate integration reads WORLD_SIZE/RANK/LOCAL_RANK from
+    # torchrun or the platform launcher.  Calling main() in-process preserves
+    # those variables and avoids a nested launcher.
+    from lerobot.scripts import lerobot_train
+
+    original_argv = sys.argv
+    try:
+        sys.argv = ["lerobot-train", *lerobot_args]
+        lerobot_train.main()
+    finally:
+        sys.argv = original_argv
+
+
 def main() -> None:
+    """Validate inputs, launch training, and export the rank-zero model artifact."""
+
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -537,6 +589,7 @@ def main() -> None:
     LOGGER.info("Resolved model dir: %s", paths.model_dir)
     LOGGER.info("Resolved device: %s", device)
     LOGGER.info("LeRobot argv:\n  %s", "\n  ".join(_redact_cli(lerobot_args)))
+
     if cli.dry_run:
         print(
             json.dumps(
@@ -560,19 +613,10 @@ def main() -> None:
             f"Training work directory already exists: {paths.work_dir}. "
             "Choose another --work-dir or resume from its last checkpoint."
         )
+
     paths.work_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    # LeRobot's Accelerate integration reads WORLD_SIZE/RANK/LOCAL_RANK from
-    # torchrun or the platform launcher.  Calling main() in-process preserves
-    # those variables and avoids a nested launcher.
-    from lerobot.scripts import lerobot_train
-
-    original_argv = sys.argv
-    try:
-        sys.argv = ["lerobot-train", *lerobot_args]
-        lerobot_train.main()
-    finally:
-        sys.argv = original_argv
+    train(lerobot_args)
 
     rank = int(os.environ.get("RANK", "0"))
     if rank != 0:
