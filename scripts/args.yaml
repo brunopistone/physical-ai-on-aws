@@ -1,0 +1,50 @@
+model:
+  id: lucarrr/smolvla_so100_pickplace_finetuned_v2
+  revision: 4fde42badae91b5c88bfe1a399a3f4b994fc0698
+  freeze_vision_encoder: true
+  train_expert_only: true
+  train_state_proj: true
+# Preserve the source checkpoint's semantic camera order while adopting the
+  # simulation dataset's native feature names.
+  camera_mapping:
+    observation.images.wrist: observation.images.camera1
+    observation.images.top: observation.images.camera2
+
+dataset:
+  repo_id: local/so100_sim_pickplace
+  video_backend: pyav
+  return_uint8: true
+  # One of eight episodes is held out. Increase the dataset before treating
+  # this as a production-quality adaptation.
+  eval_split: 0.125
+
+training:
+  job_name: smolvla-so100-sim
+  steps: 1000
+  batch_size: 4
+  num_workers: auto
+  prefetch_factor: 2
+  persistent_workers: true
+  learning_rate: 0.0001
+  warmup_steps: 100
+  decay_steps: 1000
+  decay_lr: 0.0000025
+  log_freq: 10
+  eval_steps: 250
+  max_eval_samples: 128
+  save_checkpoint: true
+  save_freq: 500
+  seed: 42
+  # PyTorch 2.8 + the current LeRobot GradScaler cannot unscale BF16 gradients.
+  use_amp: false
+
+tracking:
+  wandb: false
+
+paths:
+  # Local defaults. SageMaker overrides them through SM_CHANNEL_TRAIN,
+  # SM_CHECKPOINT_DIR, and SM_MODEL_DIR. Kubernetes jobs should pass explicit
+  # mount paths with --dataset-dir/--work-dir/--model-dir.
+  dataset_dir: datasets/so100_sim_pickplace
+  work_dir: outputs/smolvla-so100/work
+  model_dir: outputs/smolvla-so100/model

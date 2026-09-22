@@ -1,0 +1,24 @@
+# Unified runtime for all four workshop notebooks.
+# The training container/job keeps its intentionally smaller dependency set in
+# scripts/requirements.txt.
+
+# Robotics, MuJoCo, and the local SmolVLA policy wrapper.
+strands-robots[sim-mujoco,smolvla] @ git+https://github.com/strands-labs/robots.git@f469c137cf3a16caa5d1300586e695df3efafa50
+lerobot[smolvla]==0.6.1
+torch==2.11.0
+mujoco==3.12.0
+numpy==2.2.6
+Pillow==12.3.0
+av==15.1.0
+
+# SageMaker launcher and S3/model-artifact evaluation.
+sagemaker==3.21.0
+boto3==1.43.99
+pandas==2.3.3
+PyYAML==6.0.3
+
+# Notebook runtime and rich progress widgets.
+jupyterlab==4.6.3
+ipykernel==7.3.0
+ipython==9.17.1
+ipywidgets==8.1.9

@@ -1,0 +1,5 @@
+# The runtime entrypoint delegates optimization, distributed execution,
+# checkpointing, and processor export to LeRobot.
+lerobot[smolvla,training]==0.6.1
+PyYAML>=6.0,<7
+av>=15,<16
