@@ -55,6 +55,19 @@ SO100_SMOLVLA_EMBODIMENT = {
     "gripper_joint_range": list(GRIPPER_JOINT_RANGE),
 }
 
+FINETUNED_SMOLVLA_EMBODIMENT = {
+    "name": "so100_smolvla_sim_finetuned",
+    "obs_rename": {
+        "wrist": "observation.images.wrist",
+        "top": "observation.images.top",
+    },
+    "state_keys": JOINT_KEYS,
+    "action_keys": JOINT_KEYS,
+    "dim_policy": "strict",
+    "state_units": "radians",
+    "action_units": "radians",
+}
+
 VIDEO_PATH = Path(__file__).resolve().parents[1] / "smolvla_pick.mp4"
 
 
@@ -101,6 +114,28 @@ def load_policy(device: str = "auto") -> tuple[Any, str]:
         policy_type="smolvla",
         device=resolved_device,
         embodiment=SO100_SMOLVLA_EMBODIMENT,
+        strict_keys=True,
+    )
+    return policy, resolved_device
+
+
+def load_finetuned_policy(
+    model_dir: str | Path,
+    device: str = "auto",
+) -> tuple[Any, str]:
+    """Load a simulation-fine-tuned SmolVLA checkpoint from a local directory."""
+
+    checkpoint = Path(model_dir).expanduser().resolve()
+    if not (checkpoint / "config.json").is_file():
+        raise FileNotFoundError(f"No SmolVLA config.json found under {checkpoint}")
+
+    resolved_device = choose_device(device)
+    policy = create_policy(
+        "lerobot_local",
+        pretrained_name_or_path=str(checkpoint),
+        policy_type="smolvla",
+        device=resolved_device,
+        embodiment=FINETUNED_SMOLVLA_EMBODIMENT,
         strict_keys=True,
     )
     return policy, resolved_device
@@ -209,6 +244,7 @@ if __name__ == "__main__":
 __all__ = [
     "BOX_CENTER",
     "DEFAULT_SCENARIO_NAME",
+    "FINETUNED_SMOLVLA_EMBODIMENT",
     "INSTRUCTION",
     "JOINT_KEYS",
     "MODEL_ID",
@@ -219,6 +255,7 @@ __all__ = [
     "build_scene",
     "choose_device",
     "cube_diagnostics",
+    "load_finetuned_policy",
     "load_policy",
     "run_rollout",
 ]

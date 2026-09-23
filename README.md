@@ -6,8 +6,8 @@ This workshop implements a complete Physical AI data loop:
 scripted teacher
       │
       ▼
-simulation demonstrations ──▶ zero-shot VLA baseline ──▶ fine-tuning ──▶ before/after evaluation
-        Notebook 1                 Notebook 2              Notebook 3          Notebook 4
+simulation demonstrations ─▶ zero-shot baseline ─▶ fine-tuning ─▶ evaluation ─▶ agentic supervision
+        Notebook 1              Notebook 2          Notebook 3     Notebook 4        Notebook 5
 ```
 
 The reference task is:
@@ -16,8 +16,9 @@ The reference task is:
 
 The workshop starts in MuJoCo, records a LeRobot dataset, demonstrates why a
 checkpoint trained on real-camera data can fail under simulation domain shift,
-fine-tunes SmolVLA with a SageMaker Training Job, and evaluates the updated
-checkpoint under the same physical conditions.
+fine-tunes SmolVLA with a SageMaker Training Job, evaluates the updated
+checkpoint under the same physical conditions, and adds a bounded Strands Agent
+above the learned policy.
 
 ## Table of Contents
 
@@ -28,6 +29,7 @@ checkpoint under the same physical conditions.
   - [`code/scenarios/pick_place.py`](#codescenariospick_placepy)
   - [`code/so100_teacher.py`](#codeso100_teacherpy)
   - [`code/vla_pick.py`](#codevla_pickpy)
+  - [`code/agentic_pick.py`](#codeagentic_pickpy)
   - [Add another scenario](#add-another-scenario)
 - [Reference Configuration](#reference-configuration)
 - [Quick Start](#quick-start)
@@ -39,6 +41,7 @@ checkpoint under the same physical conditions.
 - [Training Environments](#training-environments)
 - [SageMaker Training](#sagemaker-training)
 - [Evaluation](#evaluation)
+- [Agentic Supervision](#agentic-supervision)
 - [Repository Layout](#repository-layout)
 - [Common Warnings and Failures](#common-warnings-and-failures)
 - [Extending the Workshop](#extending-the-workshop)
@@ -53,6 +56,7 @@ checkpoint under the same physical conditions.
 - How LeRobot stores video, state, action, task, and episode boundaries.
 - How to launch the same training entrypoint locally, on SageMaker, EKS, or HyperPod.
 - How to compare two policies using a physical task metric rather than API status.
+- How a Strands Agent supervises a policy without becoming the joint controller.
 
 ## Workshop Notebooks
 
@@ -62,9 +66,17 @@ checkpoint under the same physical conditions.
 | [`02_smolvla_pick.ipynb`](02_smolvla_pick.ipynb)         | Run the original real-data SmolVLA checkpoint in MuJoCo                              | Zero-shot video and `placed_in_box` baseline |
 | [`03_finetune_smolvla.ipynb`](03_finetune_smolvla.ipynb) | Generate `args.yaml`, upload inputs, and launch a SageMaker Training Job             | Fine-tuned SmolVLA checkpoint in S3          |
 | [`04_evaluate_smolvla.ipynb`](04_evaluate_smolvla.ipynb) | Find the latest completed job, download its model, and compare before/after rollouts | Comparison table, metrics, and two videos    |
+| [`05_agentic_pick.ipynb`](05_agentic_pick.ipynb)         | Add a bounded Strands Agent above the fine-tuned policy                              | Agent trace, task verdict, segment videos    |
 
 Run the notebooks in order. Notebook 4 deliberately reruns the baseline instead
-of assuming that a successful inference call means task success.
+of assuming that a successful inference call means task success. Notebook 5
+reuses the downloaded fine-tuned checkpoint.
+
+Notebooks 2, 4, and 5 intentionally show their complete runtime logic in the
+cells: scene construction, embodiment mapping, policy loading, rollout,
+physical metrics, and agent tools. The equivalent modules under `code/` remain
+available for automation and command-line reuse, but these notebooks do not
+import them.
 
 ## Simulation Scenario Architecture
 
@@ -79,7 +91,8 @@ code/
 │   ├── __init__.py      # explicit registry
 │   └── README.md        # template and extension guide
 ├── so100_teacher.py     # teacher for the pick-place scenario
-└── vla_pick.py          # learned-policy inference over registered scenarios
+├── vla_pick.py          # learned-policy inference over registered scenarios
+└── agentic_pick.py      # bounded task-level tools for a Strands Agent
 ```
 
 ### The `SimulationScenario` contract
@@ -123,9 +136,9 @@ This is the current concrete scenario. It owns:
 - `placed_in_box` diagnostics;
 - the lazy factory for `SO100PickPlaceTeacher`.
 
-Notebook 1 uses this module through the registry. `vla_pick.py` also uses it as
-the default evaluation scenario, so data collection and evaluation share the
-same scene and metric.
+Notebook 1 uses this module through the registry, and `vla_pick.py` uses it for
+the reusable CLI path. Notebooks 2, 4, and 5 reproduce the same scene and metric
+inline so participants can inspect every step.
 
 ### `code/so100_teacher.py`
 
@@ -144,8 +157,10 @@ This module contains the learned-policy side:
 - pinned zero-shot SmolVLA checkpoint and original embodiment conversion;
 - scenario selection through the registry;
 - baseline policy loading;
+- fine-tuned policy loading with simulation-native units and camera keys;
 - common rollout logic;
-- compatibility exports used by Notebooks 2 and 4.
+- a reusable command-line path equivalent to the steps shown in Notebooks 2
+  and 4.
 
 It can run any registered scenario that remains compatible with the current
 SO100 checkpoint:
@@ -153,6 +168,20 @@ SO100 checkpoint:
 ```bash
 python code/vla_pick.py --scenario so100_pick_place
 ```
+
+### `code/agentic_pick.py`
+
+This module packages the same two least-privilege tools demonstrated in
+Notebook 5:
+
+- `inspect_pick_task()` reads deterministic scenario diagnostics;
+- `run_smolvla_segment()` reuses one preloaded policy object and calls the
+  native `sim.run_policy(...)` control loop for a bounded number of steps.
+
+It also owns the shared step budget, attempt history, deterministic
+`inside_region` early-stop clause, and the agent system prompt. The language
+model never receives a joint-action interface. Notebook 5 defines the same
+pieces inline for teaching; this module is the reusable packaged form.
 
 ### Add another scenario
 
@@ -494,12 +523,8 @@ The standalone form is:
 python code/vla_pick.py --scenario my_task
 ```
 
-For Notebook 4, update its scenario selection/calls so both baseline and
-fine-tuned policies use:
-
-- `build_scene("my_task")`;
-- `run_rollout(..., scenario_name="my_task")`;
-- `cube_diagnostics(..., scenario_name="my_task")`.
+For Notebook 4, adapt the inline scene-construction, rollout, and metric cells
+so both baseline and fine-tuned policies use the new scenario.
 
 The before/after comparison is valid only when both checkpoints see the same
 fresh scene, instruction, cameras, rollout length, and physical success metric.
@@ -523,12 +548,13 @@ copyable scenario skeleton.
 
 ### Module usage by notebook
 
-| Notebook                          | Scenario registry | `so100_teacher.py` | `vla_pick.py` | `scripts/train.py` |
-| --------------------------------- | :---------------: | :----------------: | :-----------: | :----------------: |
-| 1. Simulation and data collection |        Yes        |    Via scenario    |      No       |         No         |
-| 2. Zero-shot VLA baseline         | Via `vla_pick.py` |         No         |      Yes      |         No         |
-| 3. SageMaker fine-tuning          |        No         |         No         |      No       |        Yes         |
-| 4. Fine-tuned evaluation          | Via `vla_pick.py` |         No         |      Yes      |         No         |
+| Notebook                          | Scenario registry | `so100_teacher.py` | `vla_pick.py` | `agentic_pick.py` | `scripts/train.py` |
+| --------------------------------- | :---------------: | :----------------: | :-----------: | :---------------: | :----------------: |
+| 1. Simulation and data collection |        Yes        |    Via scenario    |      No       |        No         |         No         |
+| 2. Zero-shot VLA baseline         |   Logic inline    |         No         |  No (inline)  |        No         |         No         |
+| 3. SageMaker fine-tuning          |        No         |         No         |      No       |        No         |        Yes         |
+| 4. Fine-tuned evaluation          |   Logic inline    |         No         |  No (inline)  |        No         |         No         |
+| 5. Agentic supervision            |   Logic inline    |         No         |  No (inline)  |    No (inline)    |         No         |
 
 ## Reference Configuration
 
@@ -888,6 +914,30 @@ Notebook 4:
 `run_policy status="success"` means the software loop completed. It does not
 mean that the robot completed the task.
 
+## Agentic Supervision
+
+Notebook 5 uses the official `strands-robots` control boundary:
+
+```text
+Strands Agent
+  ├─ inspect_pick_task()       deterministic task feedback
+  └─ run_smolvla_segment()     bounded task request
+          └─ sim.run_policy()
+                └─ SmolVLA observation → action loop at 30 Hz
+```
+
+`Robot("so100")` is itself a Strands `AgentTool` whose JSON schema publishes 77
+simulation actions. A general operator can therefore use
+`Agent(tools=[sim])`. This workshop deliberately wraps that broad interface in
+two narrower tools so the checkpoint is loaded once, the LLM cannot mutate the
+scene arbitrarily, and the total control-step budget is enforced in code.
+Notebook 5 shows these tools and the budget state directly in its cells;
+`code/agentic_pick.py` is the reusable equivalent.
+
+The agent contributes task-level reasoning: inspect, invoke the policy, read
+`placed_in_box`, continue within the budget, and state an honest verdict. It
+does not replace the VLA, emit joint commands, or repair weak model weights.
+
 ## Repository Layout
 
 ```text
@@ -896,6 +946,7 @@ mean that the robot completed the task.
 ├── 02_smolvla_pick.ipynb
 ├── 03_finetune_smolvla.ipynb
 ├── 04_evaluate_smolvla.ipynb
+├── 05_agentic_pick.ipynb
 ├── requirements.txt
 ├── code/
 │   ├── scenarios/
@@ -903,6 +954,7 @@ mean that the robot completed the task.
 │   │   ├── pick_place.py
 │   │   ├── __init__.py
 │   │   └── README.md
+│   ├── agentic_pick.py
 │   ├── so100_teacher.py
 │   └── vla_pick.py
 ├── scripts/
@@ -986,4 +1038,6 @@ For a new task or dataset:
 - The workshop does not implement reinforcement learning, DPO, GRPO, or text
   SFT.
 - The default evaluation is simulation-only.
+- The agent can retry or stop a policy; it cannot create a grasp skill absent
+  from the checkpoint and demonstrations.
 - Nothing in this repository is a real-robot safety controller.
