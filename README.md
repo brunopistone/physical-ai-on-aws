@@ -56,7 +56,8 @@ above the learned policy.
 - How LeRobot stores video, state, action, task, and episode boundaries.
 - How to launch the same training entrypoint locally, on SageMaker, EKS, or HyperPod.
 - How to compare two policies using a physical task metric rather than API status.
-- How a Strands Agent supervises a policy without becoming the joint controller.
+- How a local Strands Agent maps a free-form goal to validated robot skills
+  without becoming the joint controller.
 
 ## Workshop Notebooks
 
@@ -66,7 +67,7 @@ above the learned policy.
 | [`02_smolvla_pick.ipynb`](02_smolvla_pick.ipynb)         | Run the original real-data SmolVLA checkpoint in MuJoCo                              | Zero-shot video and `placed_in_box` baseline |
 | [`03_finetune_smolvla.ipynb`](03_finetune_smolvla.ipynb) | Generate `args.yaml`, upload inputs, and launch a SageMaker Training Job             | Fine-tuned SmolVLA checkpoint in S3          |
 | [`04_evaluate_smolvla.ipynb`](04_evaluate_smolvla.ipynb) | Find the latest completed job, download its model, and compare before/after rollouts | Comparison table, metrics, and two videos    |
-| [`05_agentic_pick.ipynb`](05_agentic_pick.ipynb)         | Add a bounded Strands Agent above the fine-tuned policy                              | Agent trace, task verdict, segment videos    |
+| [`05_agentic_pick.ipynb`](05_agentic_pick.ipynb)         | Run an offline local agent that selects bounded robot skills                         | Tool trace, task verdict, segment videos     |
 
 Run the notebooks in order. Notebook 4 deliberately reruns the baseline instead
 of assuming that a successful inference call means task success. Notebook 5
@@ -171,17 +172,20 @@ python code/vla_pick.py --scenario so100_pick_place
 
 ### `code/agentic_pick.py`
 
-This module packages the same two least-privilege tools demonstrated in
+This module packages the same three least-privilege tools demonstrated in
 Notebook 5:
 
-- `inspect_pick_task()` reads deterministic scenario diagnostics;
-- `run_smolvla_segment()` reuses one preloaded policy object and calls the
-  native `sim.run_policy(...)` control loop for a bounded number of steps.
+- `create_agent_model(provider)` selects Ollama or Amazon Bedrock without
+  changing the robot loop;
+- `inspect_robot_workspace()` discovers capabilities and deterministic state;
+- `execute_robot_skill(...)` validates a skill, target, and destination before
+  calling the native `sim.run_policy(...)` loop;
+- `request_human_help(...)` disables further motion and records an escalation.
 
-It also owns the shared step budget, attempt history, deterministic
-`inside_region` early-stop clause, and the agent system prompt. The language
-model never receives a joint-action interface. Notebook 5 defines the same
-pieces inline for teaching; this module is the reusable packaged form.
+It also owns the shared step budget, attempt history, full-task rollout
+horizon, and the agent system prompt. The language model never receives a
+joint-action interface. Notebook 5 defines the same pieces inline for teaching;
+this module is the reusable packaged form.
 
 ### Add another scenario
 
@@ -573,6 +577,9 @@ copyable scenario skeleton.
 | Dataset frequency   | 30 FPS                                               |
 | Dataset format      | LeRobotDataset: Parquet + H.264 MP4 + metadata       |
 | Success metric      | `placed_in_box`                                      |
+| Agent runtime       | Strands Agents                                       |
+| Default provider    | Ollama with `qwen3:4b`                               |
+| Optional provider   | Amazon Bedrock                                       |
 
 The real-data checkpoint originally expects `camera1`, `camera2`, and
 `camera3`. The training entrypoint preserves the semantic order
@@ -588,6 +595,20 @@ Requirements:
 - AWS credentials and SageMaker permissions for Notebooks 3 and 4.
 - Network access to Hugging Face for the public SmolVLA checkpoints.
 - Sufficient AWS quota for the selected training instance.
+- Ollama plus a tool-capable local model for Notebook 5:
+
+  ```bash
+  ollama serve
+  ollama pull qwen3:4b
+  ```
+
+Notebook 5 defaults to `AGENT_MODEL_PROVIDER=OLLAMA`. To use Bedrock instead:
+
+```bash
+export AGENT_MODEL_PROVIDER=BEDROCK
+export STRANDS_BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6
+export AWS_REGION=us-east-1
+```
 
 Start Jupyter from the repository root:
 
@@ -919,24 +940,30 @@ mean that the robot completed the task.
 Notebook 5 uses the official `strands-robots` control boundary:
 
 ```text
+free-form user goal
+  ↓
 Strands Agent
-  ├─ inspect_pick_task()       deterministic task feedback
-  └─ run_smolvla_segment()     bounded task request
-          └─ sim.run_policy()
-                └─ SmolVLA observation → action loop at 30 Hz
+  ├─ model: Ollama (on-device) or Bedrock (connected)
+  ├─ inspect_robot_workspace()
+  ├─ execute_robot_skill(skill, target, destination)
+  │    └─ canonical instruction → sim.run_policy()
+  │         └─ SmolVLA observation → action loop at 30 Hz
+  └─ request_human_help(reason)
 ```
 
 `Robot("so100")` is itself a Strands `AgentTool` whose JSON schema publishes 77
 simulation actions. A general operator can therefore use
 `Agent(tools=[sim])`. This workshop deliberately wraps that broad interface in
-two narrower tools so the checkpoint is loaded once, the LLM cannot mutate the
-scene arbitrarily, and the total control-step budget is enforced in code.
-Notebook 5 shows these tools and the budget state directly in its cells;
+three narrower tools so the checkpoint is loaded once, the local LLM cannot
+mutate the scene arbitrarily, unsupported capabilities are refused, and the
+total control-step budget is enforced in code. Notebook 5 shows these tools,
+the capability catalog, and the budget state directly in its cells;
 `code/agentic_pick.py` is the reusable equivalent.
 
-The agent contributes task-level reasoning: inspect, invoke the policy, read
-`placed_in_box`, continue within the budget, and state an honest verdict. It
-does not replace the VLA, emit joint commands, or repair weak model weights.
+The selected agent model interprets a free-form goal, discovers available
+entities and skills, chooses structured tool arguments, reads `placed_in_box`,
+retries once, and escalates when recovery is exhausted. It does not replace the
+VLA, emit joint commands, or repair weak model weights.
 
 ## Repository Layout
 

@@ -2,8 +2,9 @@
 # The training container/job keeps its intentionally smaller dependency set in
 # scripts/requirements.txt.
 
-# Robotics, MuJoCo, and the local SmolVLA policy wrapper.
-strands-agents==1.54.0
+# Robotics, local agent runtime, MuJoCo, and the SmolVLA policy wrapper.
+strands-agents[ollama]==1.54.0
+ollama==0.6.2
 strands-robots[sim-mujoco,smolvla] @ git+https://github.com/strands-labs/robots.git@f469c137cf3a16caa5d1300586e695df3efafa50
 lerobot[smolvla]==0.6.1
 torch==2.11.0

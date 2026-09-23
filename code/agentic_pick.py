@@ -9,21 +9,93 @@ the high-frequency observation-inference-action loop.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from strands import tool
 
 from scenarios import get_scenario
 from scenarios.pick_place import BOX_CENTER
 
-SUCCESS_STOP_WHEN = {
-    "predicate": "inside_region",
-    "body": "cube",
-    "min": [float(BOX_CENTER[0] - 0.045), float(BOX_CENTER[1] - 0.045), 0.0],
-    "max": [float(BOX_CENTER[0] + 0.045), float(BOX_CENTER[1] + 0.045), 0.10],
+SUPPORTED_SKILLS = {
+    "pick_and_place": {
+        "targets": ["cube"],
+        "destinations": ["box"],
+        "instruction_template": "Pick up the {target} and place it in the {destination}.",
+    }
 }
+
+
+def create_agent_model(provider: str) -> Any:
+    """Create the task-level reasoning model for Ollama or Amazon Bedrock.
+
+    Args:
+        provider: Model provider name: ``"OLLAMA"`` or ``"BEDROCK"``.
+
+    Returns:
+        A Strands model instance configured from environment variables.
+
+    Raises:
+        RuntimeError: If Ollama is unreachable or its configured model is absent.
+        ValueError: If ``provider`` is not one of the supported names.
+    """
+
+    normalized = provider.strip().upper()
+    if normalized == "OLLAMA":
+        from strands.models.ollama import OllamaModel
+
+        host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+        if "://" not in host:
+            host = "http://" + host
+        model_id = os.environ.get("STRANDS_LOCAL_MODEL", "qwen3:4b")
+        try:
+            with urlopen(f"{host}/api/tags", timeout=3) as response:
+                tags = json.load(response)
+        except (URLError, TimeoutError) as error:
+            raise RuntimeError(
+                f"Cannot reach Ollama at {host}. Start it with: ollama serve"
+            ) from error
+
+        available = {
+            model_name
+            for item in tags.get("models", [])
+            if (model_name := item.get("name") or item.get("model"))
+        }
+        if model_id not in available:
+            raise RuntimeError(
+                f"Local model {model_id!r} is not installed. "
+                f"Run: ollama pull {model_id}. Available: {sorted(available)}"
+            )
+        return OllamaModel(
+            host=host,
+            model_id=model_id,
+            temperature=0.0,
+            keep_alive="15m",
+        )
+
+    if normalized == "BEDROCK":
+        import boto3
+        from strands.models import BedrockModel
+
+        region = (
+            os.environ.get("AWS_REGION")
+            or boto3.Session().region_name
+            or "us-east-1"
+        )
+        model_id = os.environ.get(
+            "STRANDS_BEDROCK_MODEL_ID",
+            "global.anthropic.claude-sonnet-4-6",
+        )
+        return BedrockModel(model_id=model_id, region_name=region)
+
+    raise ValueError(
+        f"Unsupported agent model provider {provider!r}. "
+        "Choose 'OLLAMA' or 'BEDROCK'."
+    )
 
 
 @dataclass
@@ -34,7 +106,9 @@ class AgenticLoopState:
     max_total_steps: int
     total_steps_used: int = 0
     attempts: list[dict[str, Any]] = field(default_factory=list)
+    escalations: list[dict[str, Any]] = field(default_factory=list)
     terminal_error: str | None = None
+    escalated: bool = False
 
     @property
     def remaining_steps(self) -> int:
@@ -84,8 +158,8 @@ def create_agentic_pick_tools(
     *,
     scenario_name: str = "so100_pick_place",
     output_dir: str | Path = "outputs/agentic-pick",
-    segment_steps: int = 200,
-    max_total_steps: int = 400,
+    segment_steps: int = 400,
+    max_total_steps: int = 800,
     record_video: bool = True,
 ) -> tuple[list[Any], AgenticLoopState]:
     """Create bounded tools that capture one simulation and one loaded policy.
@@ -120,24 +194,66 @@ def create_agentic_pick_tools(
     )
 
     @tool
-    def inspect_pick_task() -> dict[str, Any]:
-        """Read the authoritative task metric without moving the robot."""
+    def inspect_robot_workspace() -> dict[str, Any]:
+        """Discover capabilities and authoritative task state without moving."""
 
         diagnostics = scenario.diagnostics(sim)
         return _tool_result(
             {
                 "task_success": bool(diagnostics[scenario.success_key]),
                 "diagnostics": diagnostics,
+                "available_entities": {
+                    "targets": ["cube"],
+                    "destinations": ["box"],
+                },
+                "supported_skills": SUPPORTED_SKILLS,
                 "segments_completed": len(state.attempts),
+                "escalated": state.escalated,
                 "steps_used": state.total_steps_used,
                 "remaining_steps": state.remaining_steps,
             }
         )
 
     @tool
-    def run_smolvla_segment() -> dict[str, Any]:
-        """Run the loaded SmolVLA for one bounded segment, then report task state."""
+    def execute_robot_skill(
+        skill: str,
+        target: str,
+        destination: str,
+    ) -> dict[str, Any]:
+        """Execute one supported skill through the local SmolVLA policy.
 
+        Args:
+            skill: Skill name discovered through ``inspect_robot_workspace``.
+            target: Object to manipulate, using its workspace name.
+            destination: Named destination for the object.
+        """
+
+        contract = SUPPORTED_SKILLS.get(skill)
+        if contract is None:
+            return _tool_result(
+                {
+                    "error": f"Unsupported skill: {skill!r}",
+                    "supported_skills": sorted(SUPPORTED_SKILLS),
+                },
+                status="error",
+            )
+        if target not in contract["targets"] or destination not in contract["destinations"]:
+            return _tool_result(
+                {
+                    "error": "The requested target or destination is unsupported.",
+                    "supported_targets": contract["targets"],
+                    "supported_destinations": contract["destinations"],
+                },
+                status="error",
+            )
+        if state.escalated:
+            return _tool_result(
+                {
+                    "error": "Physical execution is disabled after escalation.",
+                    "task_success": False,
+                },
+                status="error",
+            )
         if state.terminal_error is not None:
             return _tool_result(
                 {
@@ -169,6 +285,10 @@ def create_agentic_pick_tools(
                 status="error",
             )
 
+        policy_instruction = contract["instruction_template"].format(
+            target=target,
+            destination=destination,
+        )
         steps = min(state.segment_steps, state.remaining_steps)
         segment_number = len(state.attempts) + 1
         video_path = video_dir / f"segment_{segment_number:02d}.mp4"
@@ -184,12 +304,11 @@ def create_agentic_pick_tools(
         result = sim.run_policy(
             robot_name=scenario.robot_name,
             policy_object=policy,
-            instruction=scenario.instruction,
+            instruction=policy_instruction,
             n_steps=steps,
             control_frequency=scenario.fps,
             fast_mode=True,
             video=video,
-            stop_when=SUCCESS_STOP_WHEN,
         )
         report = _json_payload(result)
         measured_steps = int(report.get("steps_used", report.get("n_steps", 0)) or 0)
@@ -199,6 +318,10 @@ def create_agentic_pick_tools(
         task_success = bool(diagnostics[scenario.success_key])
         attempt = {
             "segment": segment_number,
+            "skill": skill,
+            "target": target,
+            "destination": destination,
+            "policy_instruction": policy_instruction,
             "run_status": result.get("status"),
             "task_success": task_success,
             "steps_requested": steps,
@@ -219,36 +342,51 @@ def create_agentic_pick_tools(
             status="success" if result.get("status") == "success" else "error",
         )
 
-    return [inspect_pick_task, run_smolvla_segment], state
+    @tool
+    def request_human_help(reason: str) -> dict[str, Any]:
+        """Stop physical execution and record why assistance is required.
+
+        Args:
+            reason: Concise explanation of the unsupported goal or repeated failure.
+        """
+
+        escalation = {
+            "reason": reason,
+            "diagnostics": scenario.diagnostics(sim),
+            "steps_used": state.total_steps_used,
+        }
+        state.escalations.append(escalation)
+        state.escalated = True
+        return _tool_result({"escalated": True, **escalation})
+
+    return [inspect_robot_workspace, execute_robot_skill, request_human_help], state
 
 
 def build_agent_system_prompt(*, segment_steps: int, max_total_steps: int) -> str:
     """Return the high-level supervisor contract read by the Strands Agent."""
 
-    return f"""You are a high-level robot task supervisor.
+    return f"""You are the local high-level supervisor running on a robot companion computer.
 
-The SmolVLA policy, not you, controls the robot joints. You may only:
-1. call inspect_pick_task to read the deterministic physical task metric;
-2. call run_smolvla_segment to let the policy act for up to {segment_steps} control steps.
+Interpret the user's free-form goal, but never command robot joints yourself.
+The local SmolVLA policy owns joint actions. You may only use these tools:
+1. inspect_robot_workspace: discover entities, supported skills, physical state, and remaining budget;
+2. execute_robot_skill: choose a supported skill, target, and destination;
+3. request_human_help: stop physical execution when the goal is unsupported or recovery is exhausted.
 
-Follow this closed loop:
-- Inspect before acting.
-- If task_success is already true, stop.
-- Otherwise run one policy segment and inspect the returned task_success.
-- If it is false and remaining_steps is positive, inspect once more and run another segment.
-- Stop immediately on task_success=true, a software/tool error, or exhausted budget.
+Always inspect before acting. Map the goal only onto capabilities returned by
+inspection. Execute one segment, inspect its deterministic result, and retry
+at most once while budget remains. Request human help for an unsupported goal,
+a tool failure, or an unsuccessful retry.
 
-The total policy budget is {max_total_steps} steps. Never infer success from
-run_status='success': that only means the software loop ran. Report success
-only when the tool returns task_success=true. If the budget ends with
-task_success=false, clearly report a physical task failure and recommend more
-or better demonstrations rather than claiming that agent reasoning repaired
-the low-level policy."""
+The hard policy budget is {max_total_steps} steps; each segment is at most
+{segment_steps} steps. run_status='success' means only that software executed.
+Report physical success only when task_success=true."""
 
 
 __all__ = [
     "AgenticLoopState",
-    "SUCCESS_STOP_WHEN",
+    "SUPPORTED_SKILLS",
     "build_agent_system_prompt",
+    "create_agent_model",
     "create_agentic_pick_tools",
 ]
