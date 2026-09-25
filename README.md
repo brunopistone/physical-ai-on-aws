@@ -20,6 +20,8 @@ fine-tunes SmolVLA with a SageMaker Training Job, evaluates the updated
 checkpoint under the same physical conditions, and adds a bounded Strands Agent
 above the learned policy.
 
+![Animated Physical AI architecture: on-robot agent, VLA policy, data collection, optional Bedrock reasoning, and cloud learning loop](./docs/assets/physical-ai-architecture.gif)
+
 ## Table of Contents
 
 - [What You Will Learn](#what-you-will-learn)
@@ -32,6 +34,7 @@ above the learned policy.
   - [`code/agentic_pick.py`](#codeagentic_pickpy)
   - [Add another scenario](#add-another-scenario)
 - [Reference Configuration](#reference-configuration)
+- [AWS Infrastructure](#aws-infrastructure)
 - [Quick Start](#quick-start)
 - [The Data Contract](#the-data-contract)
 - [Which Models Are Supported?](#which-models-are-supported)
@@ -61,13 +64,13 @@ above the learned policy.
 
 ## Workshop Notebooks
 
-| Notebook                                                 | Purpose                                                                              | Main output                                  |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------- |
-| [`01_scripted_pick.ipynb`](01_scripted_pick.ipynb)       | Build the SO100 simulation, run a scripted teacher, and record demonstrations        | `datasets/so100_sim_pickplace`               |
-| [`02_smolvla_pick.ipynb`](02_smolvla_pick.ipynb)         | Run the original real-data SmolVLA checkpoint in MuJoCo                              | Zero-shot video and `placed_in_box` baseline |
-| [`03_finetune_smolvla.ipynb`](03_finetune_smolvla.ipynb) | Generate `args.yaml`, upload inputs, and launch a SageMaker Training Job             | Fine-tuned SmolVLA checkpoint in S3          |
-| [`04_evaluate_smolvla.ipynb`](04_evaluate_smolvla.ipynb) | Find the latest completed job, download its model, and compare before/after rollouts | Comparison table, metrics, and two videos    |
-| [`05_agentic_pick.ipynb`](05_agentic_pick.ipynb)         | Run an offline local agent that selects bounded robot skills                         | Tool trace, task verdict, segment videos     |
+| Notebook                                                                       | Purpose                                                                              | Main output                                  |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ | -------------------------------------------- |
+| [`01_imitation_data_generation.ipynb`](01_imitation_data_generation.ipynb)     | Generate imitation-learning demonstrations with a scripted teacher                   | `datasets/so100_sim_pickplace`               |
+| [`02_zero_shot_vla_emulation.ipynb`](02_zero_shot_vla_emulation.ipynb)         | Emulate the original real-data VLA policy in MuJoCo                                  | Zero-shot video and `placed_in_box` baseline |
+| [`03_smolvla_fine_tuning.ipynb`](03_smolvla_fine_tuning.ipynb)                 | Generate `args.yaml`, upload inputs, and launch a SageMaker Training Job             | Fine-tuned SmolVLA checkpoint in S3          |
+| [`04_fine_tuned_vla_evaluation.ipynb`](04_fine_tuned_vla_evaluation.ipynb)     | Find the latest completed job, download its model, and compare before/after rollouts | Comparison table, metrics, and two videos    |
+| [`05_agentic_robot_orchestration.ipynb`](05_agentic_robot_orchestration.ipynb) | Orchestrate bounded robot skills with an Ollama or Bedrock agent                     | Tool trace, task verdict, segment videos     |
 
 Run the notebooks in order. Notebook 4 deliberately reruns the baseline instead
 of assuming that a successful inference call means task success. Notebook 5
@@ -463,7 +466,7 @@ will fail with the available names.
 Edit the selection cell in:
 
 ```text
-01_scripted_pick.ipynb
+01_imitation_data_generation.ipynb
 ```
 
 Change only:
@@ -483,7 +486,7 @@ demonstrations for a meaningful fine-tuning experiment.
 
 For a new task with the same SO100/top+wrist/6D/radians contract:
 
-1. In `03_finetune_smolvla.ipynb`, update the generated `args.yaml` values:
+1. In `03_smolvla_fine_tuning.ipynb`, update the generated `args.yaml` values:
    - `dataset.repo_id`;
    - job name;
    - dataset input path if it is not obtained from the scenario output.
@@ -505,7 +508,7 @@ Review:
 - `state_action_units` written to the training manifest.
 
 Also edit the generated `model.camera_mapping` in
-`03_finetune_smolvla.ipynb` so dataset camera roles map to the correct source
+`03_smolvla_fine_tuning.ipynb` so dataset camera roles map to the correct source
 checkpoint camera roles.
 
 If the policy family changes from SmolVLA to ACT, Diffusion Policy, π0, GR00T,
@@ -586,6 +589,24 @@ The real-data checkpoint originally expects `camera1`, `camera2`, and
 `camera1=wrist`, `camera2=top`, removes the unused third camera, and exports a
 checkpoint with the simulation-native `wrist` and `top` feature names.
 
+## AWS Infrastructure
+
+[`infrastructure/cloudformation/workshop.yaml`](infrastructure/cloudformation/workshop.yaml)
+creates the workshop prerequisites:
+
+- an encrypted, versioned artifact bucket;
+- a shared workload role trusted by SageMaker, EKS Pod Identity, and EC2;
+- an instance profile for EC2-backed and HyperPod Slurm workers;
+- S3, CloudWatch, ECR, and Bedrock permissions on that role;
+- an optional ECR repository.
+
+The stack does not create billable GPU compute. On stack deletion, a dedicated
+Lambda permanently removes every object version and multipart upload before
+CloudFormation deletes the bucket; the optional ECR repository is also emptied.
+See
+[`infrastructure/cloudformation/README.md`](infrastructure/cloudformation/README.md)
+for deployment, deletion, IAM, EKS, and HyperPod details.
+
 ## Quick Start
 
 Requirements:
@@ -601,6 +622,19 @@ Requirements:
   ollama serve
   ollama pull qwen3:4b
   ```
+
+To provision the AWS prerequisites:
+
+```bash
+aws cloudformation deploy \
+  --template-file infrastructure/cloudformation/workshop.yaml \
+  --stack-name physical-ai-workshop \
+  --capabilities CAPABILITY_IAM
+```
+
+Notebook 3 defaults to `workshop_stack_name = "physical-ai-workshop"` and reads
+the bucket and execution-role ARN from its outputs. Edit that configuration
+variable if the stack was deployed under another name.
 
 Notebook 5 defaults to `AGENT_MODEL_PROVIDER=OLLAMA`. To use Bedrock instead:
 
@@ -969,11 +1003,11 @@ VLA, emit joint commands, or repair weak model weights.
 
 ```text
 .
-├── 01_scripted_pick.ipynb
-├── 02_smolvla_pick.ipynb
-├── 03_finetune_smolvla.ipynb
-├── 04_evaluate_smolvla.ipynb
-├── 05_agentic_pick.ipynb
+├── 01_imitation_data_generation.ipynb
+├── 02_zero_shot_vla_emulation.ipynb
+├── 03_smolvla_fine_tuning.ipynb
+├── 04_fine_tuned_vla_evaluation.ipynb
+├── 05_agentic_robot_orchestration.ipynb
 ├── requirements.txt
 ├── code/
 │   ├── scenarios/
@@ -992,6 +1026,13 @@ VLA, emit joint commands, or repair weak model weights.
 │   ├── Dockerfile
 │   ├── create-image.sh
 │   └── README.md
+├── infrastructure/
+│   └── cloudformation/
+│       ├── workshop.yaml
+│       └── README.md
+├── docs/
+│   └── assets/
+│       └── physical-ai-architecture.gif
 └── datasets/
     └── so100_sim_pickplace/
 ```

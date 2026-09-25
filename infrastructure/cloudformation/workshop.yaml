@@ -1,0 +1,635 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Shared AWS prerequisites for the Physical AI on AWS workshop: an auto-cleaned
+  artifact bucket, a multi-runtime workload role, and an optional ECR repository.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: physical-ai-workshop
+    Description: Value applied to Project tags.
+    AllowedPattern: "^[a-zA-Z0-9._-]{1,64}$"
+
+  ArtifactBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional globally unique S3 bucket name. Leave empty to let CloudFormation
+      generate one.
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+
+  CreateEcrRepository:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Create the optional repository used by the custom training image.
+
+  EcrRepositoryName:
+    Type: String
+    Default: smolvla-training
+    Description: Name of the optional ECR repository.
+    AllowedPattern: "^[a-z0-9]+(?:[._/-][a-z0-9]+)*$"
+
+  NoncurrentVersionExpirationDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days to retain noncurrent S3 object versions while the stack exists.
+
+Conditions:
+  HasArtifactBucketName: !Not
+    - !Equals
+      - !Ref ArtifactBucketName
+      - ""
+  ShouldCreateEcrRepository: !Equals
+    - !Ref CreateEcrRepository
+    - "true"
+
+Resources:
+  WorkshopArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !If
+        - HasArtifactBucketName
+        - !Ref ArtifactBucketName
+        - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ManageOldVersionsAndIncompleteUploads
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WorkshopArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WorkshopArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt WorkshopArtifactBucket.Arn
+              - !Sub "${WorkshopArtifactBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  WorkshopExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >
+        Shared workshop workload role for SageMaker, EKS Pod Identity, and
+        EC2-backed HyperPod or standalone workers.
+      MaxSessionDuration: 43200
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SageMakerWorkloads
+            Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:*"
+          - Sid: Ec2Workloads
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+          - Sid: EksPodIdentityWorkloads
+            Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+              - "sts:TagSession"
+      Policies:
+        - PolicyName: WorkshopArtifactAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadWorkshopBucket
+                Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListBucketVersions"
+                Resource: !GetAtt WorkshopArtifactBucket.Arn
+              - Sid: ManageWorkshopObjects
+                Effect: Allow
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:PutObject"
+                Resource: !Sub "${WorkshopArtifactBucket.Arn}/*"
+        - PolicyName: WorkshopCloudWatchAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteWorkshopLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:DescribeLogStreams"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*"
+              - Sid: PublishTrainingMetrics
+                Effect: Allow
+                Action: "cloudwatch:PutMetricData"
+                Resource: "*"
+        - PolicyName: WorkshopSageMakerNetworkAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ManageTrainingNetworkInterfaces
+                Effect: Allow
+                Action:
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:CreateNetworkInterfacePermission"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:DeleteNetworkInterfacePermission"
+                  - "ec2:DescribeDhcpOptions"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeVpcs"
+                Resource: "*"
+        - PolicyName: WorkshopBedrockAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DiscoverBedrockModels
+                Effect: Allow
+                Action:
+                  - "bedrock:GetFoundationModel"
+                  - "bedrock:GetInferenceProfile"
+                  - "bedrock:ListFoundationModels"
+                  - "bedrock:ListInferenceProfiles"
+                Resource: "*"
+              - Sid: InvokeBedrockModels
+                Effect: Allow
+                Action:
+                  - "bedrock:InvokeModel"
+                  - "bedrock:InvokeModelWithResponseStream"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:application-inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:provisioned-model/*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WorkshopInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WorkshopExecutionRole
+
+  WorkshopTrainingRuntimePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Runtime integrations required by SageMaker ModelTrainer V3.
+      Roles:
+        - !Ref WorkshopExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AuthenticateToEcr
+            Effect: Allow
+            Action: "ecr:GetAuthorizationToken"
+            Resource: "*"
+          - Sid: PullTrainingImages
+            Effect: Allow
+            Action:
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:BatchGetImage"
+              - "ecr:GetDownloadUrlForLayer"
+            Resource: !Sub "arn:${AWS::Partition}:ecr:*:*:repository/*"
+          - Sid: UseTrainingKmsKeys
+            Effect: Allow
+            Action:
+              - "kms:Decrypt"
+              - "kms:Encrypt"
+              - "kms:GenerateDataKey"
+            Resource: "*"
+          - Sid: InvokeTrainingFunctions
+            Effect: Allow
+            Action: "lambda:InvokeFunction"
+            Resource: !Sub "arn:${AWS::Partition}:lambda:*:*:function:*"
+
+  WorkshopSageMakerFeaturePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: SageMaker Hub, Registry, MLflow, lineage, and evaluation permissions.
+      Roles:
+        - !Ref WorkshopExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadSageMakerHubs
+            Effect: Allow
+            Action:
+              - "sagemaker:DescribeHub"
+              - "sagemaker:DescribeHubContent"
+              - "sagemaker:ListHubContents"
+              - "sagemaker:ListHubs"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:*:hub/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:*:hub-content/*"
+          - Sid: ManageModelPackages
+            Effect: Allow
+            Action:
+              - "sagemaker:AddTags"
+              - "sagemaker:CreateModelPackage"
+              - "sagemaker:CreateModelPackageGroup"
+              - "sagemaker:DescribeModelPackage"
+              - "sagemaker:DescribeModelPackageGroup"
+              - "sagemaker:ListModelPackages"
+              - "sagemaker:UpdateModelPackage"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-package/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-package-group/*"
+          - Sid: UseSageMakerMlflow
+            Effect: Allow
+            Action:
+              - "sagemaker-mlflow:AccessUI"
+              - "sagemaker-mlflow:CreateExperiment"
+              - "sagemaker-mlflow:CreateModelVersion"
+              - "sagemaker-mlflow:CreateRegisteredModel"
+              - "sagemaker-mlflow:CreateRun"
+              - "sagemaker-mlflow:DeleteTag"
+              - "sagemaker-mlflow:FinalizeLoggedModel"
+              - "sagemaker-mlflow:Get*"
+              - "sagemaker-mlflow:ListArtifacts"
+              - "sagemaker-mlflow:ListLoggedModelArtifacts"
+              - "sagemaker-mlflow:LogBatch"
+              - "sagemaker-mlflow:LogInputs"
+              - "sagemaker-mlflow:LogLoggedModelParams"
+              - "sagemaker-mlflow:LogMetric"
+              - "sagemaker-mlflow:LogModel"
+              - "sagemaker-mlflow:LogOutputs"
+              - "sagemaker-mlflow:LogParam"
+              - "sagemaker-mlflow:RenameRegisteredModel"
+              - "sagemaker-mlflow:RestoreExperiment"
+              - "sagemaker-mlflow:RestoreRun"
+              - "sagemaker-mlflow:Search*"
+              - "sagemaker-mlflow:SetExperimentTag"
+              - "sagemaker-mlflow:SetLoggedModelTags"
+              - "sagemaker-mlflow:SetRegisteredModelAlias"
+              - "sagemaker-mlflow:SetRegisteredModelTag"
+              - "sagemaker-mlflow:SetTag"
+              - "sagemaker-mlflow:TransitionModelVersionStage"
+              - "sagemaker-mlflow:UpdateExperiment"
+              - "sagemaker-mlflow:UpdateModelVersion"
+              - "sagemaker-mlflow:UpdateRegisteredModel"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:mlflow-app/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:mlflow-tracking-server/*"
+          - Sid: DescribeSageMakerMlflow
+            Effect: Allow
+            Action:
+              - "sagemaker:DescribeMlflowApp"
+              - "sagemaker:DescribeMlflowTrackingServer"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:mlflow-app/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:mlflow-tracking-server/*"
+          - Sid: ManageEvaluationLineage
+            Effect: Allow
+            Action:
+              - "sagemaker:AddAssociation"
+              - "sagemaker:AddTags"
+              - "sagemaker:CreateAction"
+              - "sagemaker:CreateArtifact"
+              - "sagemaker:CreateContext"
+              - "sagemaker:DeleteAction"
+              - "sagemaker:DeleteArtifact"
+              - "sagemaker:DeleteAssociation"
+              - "sagemaker:DescribeAction"
+              - "sagemaker:DescribeArtifact"
+              - "sagemaker:DescribeContext"
+              - "sagemaker:ListActions"
+              - "sagemaker:ListArtifacts"
+              - "sagemaker:ListAssociations"
+              - "sagemaker:UpdateAction"
+              - "sagemaker:UpdateArtifact"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:action/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:artifact/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:context/*"
+          - Sid: ManageEvaluationTrainingJobs
+            Effect: Allow
+            Action:
+              - "sagemaker:AddTags"
+              - "sagemaker:CreateTrainingJob"
+              - "sagemaker:DescribeTrainingJob"
+              - "sagemaker:StopTrainingJob"
+            Resource: !Sub "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*"
+
+  WorkshopEcrRepository:
+    Type: AWS::ECR::Repository
+    Condition: ShouldCreateEcrRepository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      EmptyOnDelete: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      RepositoryName: !Ref EcrRepositoryName
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Remove untagged workshop images after seven days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WorkshopEcrAccessPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ShouldCreateEcrRepository
+    Properties:
+      PolicyName: WorkshopEcrAccess
+      Roles:
+        - !Ref WorkshopExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PushWorkshopImages
+            Effect: Allow
+            Action:
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:DescribeImages"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:ListImages"
+              - "ecr:PutImage"
+              - "ecr:UploadLayerPart"
+            Resource: !GetAtt WorkshopEcrRepository.Arn
+
+  BucketCleanupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Dedicated role that can empty only the workshop bucket on stack deletion.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: DeleteWorkshopBucketContents
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListWorkshopBucket
+                Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListBucketVersions"
+                Resource: !GetAtt WorkshopArtifactBucket.Arn
+              - Sid: DeleteWorkshopObjects
+                Effect: Allow
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                Resource: !Sub "${WorkshopArtifactBucket.Arn}/*"
+              - Sid: WriteCleanupLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BucketCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Empties every object version and multipart upload before bucket deletion.
+      Handler: index.handler
+      MemorySize: 256
+      Role: !GetAtt BucketCleanupFunctionRole.Arn
+      Runtime: python3.12
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client("s3")
+
+
+          def delete_batch(bucket, objects):
+              if not objects:
+                  return
+              response = s3.delete_objects(
+                  Bucket=bucket,
+                  Delete={"Objects": objects, "Quiet": True},
+              )
+              errors = response.get("Errors", [])
+              if errors:
+                  raise RuntimeError(f"S3 delete_objects failed: {errors}")
+
+
+          def abort_multipart_uploads(bucket):
+              while True:
+                  response = s3.list_multipart_uploads(Bucket=bucket, MaxUploads=1000)
+                  uploads = response.get("Uploads", [])
+                  for upload in uploads:
+                      s3.abort_multipart_upload(
+                          Bucket=bucket,
+                          Key=upload["Key"],
+                          UploadId=upload["UploadId"],
+                      )
+                  if not uploads:
+                      return
+
+
+          def delete_versions(bucket):
+              while True:
+                  response = s3.list_object_versions(Bucket=bucket, MaxKeys=1000)
+                  objects = [
+                      {"Key": item["Key"], "VersionId": item["VersionId"]}
+                      for item in response.get("Versions", [])
+                  ]
+                  objects.extend(
+                      {"Key": item["Key"], "VersionId": item["VersionId"]}
+                      for item in response.get("DeleteMarkers", [])
+                  )
+                  if not objects:
+                      return
+                  delete_batch(bucket, objects)
+
+
+          def delete_current_objects(bucket):
+              while True:
+                  response = s3.list_objects_v2(Bucket=bucket, MaxKeys=1000)
+                  objects = [{"Key": item["Key"]} for item in response.get("Contents", [])]
+                  if not objects:
+                      return
+                  delete_batch(bucket, objects)
+
+
+          def handler(event, context):
+              bucket = event["ResourceProperties"]["BucketName"]
+              physical_id = f"empty-s3-bucket-{bucket}"
+              try:
+                  if event["RequestType"] == "Delete":
+                      abort_multipart_uploads(bucket)
+                      delete_current_objects(bucket)
+                      delete_versions(bucket)
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {"BucketName": bucket},
+                      physicalResourceId=physical_id,
+                  )
+              except ClientError as error:
+                  if error.response.get("Error", {}).get("Code") == "NoSuchBucket":
+                      cfnresponse.send(
+                          event,
+                          context,
+                          cfnresponse.SUCCESS,
+                          {"BucketName": bucket},
+                          physicalResourceId=physical_id,
+                      )
+                      return
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {"Error": str(error)},
+                      physicalResourceId=physical_id,
+                      reason=str(error),
+                  )
+              except Exception as error:
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {"Error": str(error)},
+                      physicalResourceId=physical_id,
+                      reason=str(error),
+                  )
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BucketCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BucketCleanupFunction}"
+      RetentionInDays: 14
+
+  EmptyWorkshopArtifactBucket:
+    Type: Custom::EmptyWorkshopArtifactBucket
+    DependsOn:
+      - BucketCleanupLogGroup
+      - WorkshopArtifactBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt BucketCleanupFunction.Arn
+      BucketName: !Ref WorkshopArtifactBucket
+
+Outputs:
+  ArtifactBucketName:
+    Description: S3 bucket used for datasets, configs, checkpoints, and model artifacts.
+    Value: !Ref WorkshopArtifactBucket
+
+  ArtifactBucketUri:
+    Description: S3 URI of the workshop artifact bucket.
+    Value: !Sub "s3://${WorkshopArtifactBucket}"
+
+  WorkshopExecutionRoleArn:
+    Description: Shared workload role for SageMaker, EKS Pod Identity, and EC2/HyperPod nodes.
+    Value: !GetAtt WorkshopExecutionRole.Arn
+
+  WorkshopExecutionRoleName:
+    Description: Name of the shared workload role.
+    Value: !Ref WorkshopExecutionRole
+
+  WorkshopInstanceProfileArn:
+    Description: Instance profile for EC2-backed or HyperPod Slurm worker nodes.
+    Value: !GetAtt WorkshopInstanceProfile.Arn
+
+  WorkshopInstanceProfileName:
+    Description: Name of the EC2/HyperPod instance profile.
+    Value: !Ref WorkshopInstanceProfile
+
+  EcrRepositoryUri:
+    Condition: ShouldCreateEcrRepository
+    Description: URI of the optional custom training image repository.
+    Value: !GetAtt WorkshopEcrRepository.RepositoryUri

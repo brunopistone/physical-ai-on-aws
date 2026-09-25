@@ -1,6 +1,6 @@
 # SmolVLA custom training image
 
-The default SageMaker path in `03_finetune_smolvla.ipynb` uses the native
+The default SageMaker path in `03_smolvla_fine_tuning.ipynb` uses the native
 PyTorch DLC returned by `image_uris.retrieve`. This image is the optional BYOC
 path for preinstalling dependencies.
 

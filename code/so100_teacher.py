@@ -1,6 +1,6 @@
 """Scripted SO100 teacher for the pick-and-place workshop dataset.
 
-The learned policy in ``02_smolvla_pick.ipynb`` and this teacher use the same
+The learned policy in ``02_zero_shot_vla_emulation.ipynb`` and this teacher use the same
 robot, scene, cameras, language instruction, state keys, and action keys.  The
 teacher is deliberately privileged: it reads the cube pose from MuJoCo and
 builds a smooth joint-space trajectory around it.  Its purpose is to generate
