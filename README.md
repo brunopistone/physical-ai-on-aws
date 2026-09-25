@@ -25,6 +25,7 @@ above the learned policy.
 ## Table of Contents
 
 - [What You Will Learn](#what-you-will-learn)
+- [Repository Layout](#repository-layout)
 - [Workshop Notebooks](#workshop-notebooks)
 - [Simulation Scenario Architecture](#simulation-scenario-architecture)
   - [The `SimulationScenario` contract](#the-simulationscenario-contract)
@@ -37,18 +38,10 @@ above the learned policy.
 - [AWS Infrastructure](#aws-infrastructure)
 - [Quick Start](#quick-start)
 - [The Data Contract](#the-data-contract)
-- [Which Models Are Supported?](#which-models-are-supported)
 - [Which Use Cases Can Be Covered?](#which-use-cases-can-be-covered)
 - [Which Datasets Can Be Used?](#which-datasets-can-be-used)
-- [Training Configuration](#training-configuration)
-- [Training Environments](#training-environments)
-- [SageMaker Training](#sagemaker-training)
 - [Evaluation](#evaluation)
 - [Agentic Supervision](#agentic-supervision)
-- [Repository Layout](#repository-layout)
-- [Common Warnings and Failures](#common-warnings-and-failures)
-- [Extending the Workshop](#extending-the-workshop)
-- [Limitations](#limitations)
 
 ## What You Will Learn
 
@@ -61,6 +54,44 @@ above the learned policy.
 - How to compare two policies using a physical task metric rather than API status.
 - How a local Strands Agent maps a free-form goal to validated robot skills
   without becoming the joint controller.
+
+## Repository Layout
+
+```text
+.
+├── 01_imitation_data_generation.ipynb
+├── 02_zero_shot_vla_emulation.ipynb
+├── 03_smolvla_fine_tuning.ipynb
+├── 04_fine_tuned_vla_evaluation.ipynb
+├── 05_agentic_robot_orchestration.ipynb
+├── requirements.txt
+├── code/
+│   ├── scenarios/
+│   │   ├── base.py
+│   │   ├── pick_place.py
+│   │   ├── __init__.py
+│   │   └── README.md
+│   ├── agentic_pick.py
+│   ├── so100_teacher.py
+│   └── vla_pick.py
+├── scripts/
+│   ├── train.py
+│   ├── args.yaml
+│   └── requirements.txt
+├── container/
+│   ├── Dockerfile
+│   ├── create-image.sh
+│   └── README.md
+├── infrastructure/
+│   └── cloudformation/
+│       ├── workshop.yaml
+│       └── README.md
+├── docs/
+│   └── assets/
+│       └── physical-ai-architecture.gif
+└── datasets/
+    └── so100_sim_pickplace/
+```
 
 ## Workshop Notebooks
 
@@ -612,16 +643,9 @@ for deployment, deletion, IAM, EKS, and HyperPod details.
 Requirements:
 
 - Python 3.12.
-- Apple Silicon or Linux for local simulation/inference.
 - AWS credentials and SageMaker permissions for Notebooks 3 and 4.
 - Network access to Hugging Face for the public SmolVLA checkpoints.
 - Sufficient AWS quota for the selected training instance.
-- Ollama plus a tool-capable local model for Notebook 5:
-
-  ```bash
-  ollama serve
-  ollama pull qwen3:4b
-  ```
 
 To provision the AWS prerequisites:
 
@@ -630,41 +654,6 @@ aws cloudformation deploy \
   --template-file infrastructure/cloudformation/workshop.yaml \
   --stack-name physical-ai-workshop \
   --capabilities CAPABILITY_IAM
-```
-
-Notebook 3 defaults to `workshop_stack_name = "physical-ai-workshop"` and reads
-the bucket and execution-role ARN from its outputs. Edit that configuration
-variable if the stack was deployed under another name.
-
-Notebook 5 defaults to `AGENT_MODEL_PROVIDER=OLLAMA`. To use Bedrock instead:
-
-```bash
-export AGENT_MODEL_PROVIDER=BEDROCK
-export STRANDS_BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6
-export AWS_REGION=us-east-1
-```
-
-Start Jupyter from the repository root:
-
-```bash
-cd /path/to/physical-ai-on-aws
-jupyter lab
-```
-
-The notebooks install their pinned dependencies. To prepare the VLA runtime
-manually:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Validate the training entrypoint without downloading a model or starting
-training:
-
-```bash
-python scripts/train.py \
-  --config scripts/args.yaml \
-  --dry-run
 ```
 
 ## The Data Contract
@@ -763,24 +752,6 @@ This works only when:
 
 The script does not initialize SmolVLA from scratch.
 
-### Models not supported by the current trainer
-
-| Model or policy family                    | Current support | What would be required                                                  |
-| ----------------------------------------- | --------------- | ----------------------------------------------------------------------- |
-| SmolVLA + SO100 matching schema           | Yes             | New data/config may be sufficient                                       |
-| SmolVLA + another task, same SO100 schema | Yes             | New demonstrations, instruction, and metric                             |
-| SmolVLA + SO101 or another arm            | Not drop-in     | New embodiment, state/action schema, scene, and dataset                 |
-| SmolVLA + ALOHA                           | No              | 14D bimanual dataset, ALOHA adapter, new teacher/evaluation             |
-| ACT                                       | No              | ACT policy configuration and training path                              |
-| Diffusion Policy                          | No              | Diffusion-specific configuration and action semantics                   |
-| π0 / π0.5                                 | No              | Different checkpoint, processor, action head, and hardware requirements |
-| OpenVLA / GR00T                           | No              | Different model runtime and fine-tuning implementation                  |
-| Text LLM SFT, DPO, or GRPO                | No              | Use a text/TRL training entrypoint instead                              |
-| Reinforcement learning                    | No              | Environment interaction, reward, and RL training loop                   |
-
-The infrastructure interface is generic; the model adapter and training
-objective are SmolVLA-specific.
-
 ## Which Use Cases Can Be Covered?
 
 The current stack can support other instruction-conditioned SO100 tasks when
@@ -871,87 +842,6 @@ numbers while assigning different joints, units, or control semantics to them.
 These datasets can still be useful, but require a corresponding embodiment and
 model/training adapter.
 
-## Training Configuration
-
-Notebook 3 generates `args.yaml` explicitly and uploads it through the
-SageMaker `config` channel. The sample configuration is also available at
-[`scripts/args.yaml`](scripts/args.yaml).
-
-Main sections:
-
-```yaml
-model: # checkpoint, revision, frozen/trainable components, camera mapping
-dataset: # LeRobot repository identity, decoder, evaluation split
-training: # steps, batch, optimizer schedule, checkpoint and evaluation cadence
-tracking: # optional experiment tracking
-paths: # local defaults or mounted/container paths
-```
-
-Resolution order is:
-
-```text
-CLI override → environment/SageMaker channel → args.yaml
-```
-
-For the SageMaker PyTorch 2.8 DLC, use:
-
-```yaml
-training:
-  use_amp: false
-```
-
-The model already uses BF16 parameters. Enabling the current AMP/GradScaler
-path causes BF16 gradient unscale to fail on that runtime.
-
-## Training Environments
-
-| Environment            | How the script is launched                    | Storage contract                                       |
-| ---------------------- | --------------------------------------------- | ------------------------------------------------------ |
-| Local                  | `python` or `torchrun scripts/train.py`       | Local dataset/work/model directories                   |
-| SageMaker Training Job | `ModelTrainer` + `SourceCode` + `Torchrun`    | Input channels, `/opt/ml/checkpoints`, `/opt/ml/model` |
-| EKS                    | Kubernetes Job or PyTorch operator            | PVC, FSx, or Mountpoint for Amazon S3                  |
-| HyperPod EKS           | HyperPod PyTorch job or Kubernetes scheduling | Shared mounted dataset/checkpoints                     |
-| HyperPod Slurm         | `srun`/`torchrun`                             | Shared FSx or another shared filesystem                |
-
-The training logic is the same. Launch configuration, networking, storage, and
-distributed rendezvous remain platform-specific.
-
-## SageMaker Training
-
-Notebook 3 uses the native SageMaker PyTorch DLC by default:
-
-```python
-image_uri = image_uris.retrieve(
-    framework="pytorch",
-    version="2.8.0",
-    instance_type=instance_type,
-    image_scope="training",
-)
-```
-
-`SourceCode` packages `scripts/train.py` independently from the image. Dataset
-and YAML configuration are separate input channels.
-
-The optional custom image is built from a digest-pinned NVIDIA CUDA/Ubuntu
-runtime rather than from a SageMaker image. It installs Python, PyTorch,
-LeRobot, and the SageMaker training toolkits, but does not copy:
-
-- `train.py`;
-- `args.yaml`;
-- datasets;
-- model weights;
-- credentials.
-
-Build and push it from the repository root:
-
-```bash
-./container/create-image.sh \
-  smolvla-training latest container/Dockerfile .
-```
-
-See [`container/README.md`](container/README.md) for details and validation
-limits.
-
 ## Evaluation
 
 Notebook 4:
@@ -998,114 +888,3 @@ The selected agent model interprets a free-form goal, discovers available
 entities and skills, chooses structured tool arguments, reads `placed_in_box`,
 retries once, and escalates when recovery is exhausted. It does not replace the
 VLA, emit joint commands, or repair weak model weights.
-
-## Repository Layout
-
-```text
-.
-├── 01_imitation_data_generation.ipynb
-├── 02_zero_shot_vla_emulation.ipynb
-├── 03_smolvla_fine_tuning.ipynb
-├── 04_fine_tuned_vla_evaluation.ipynb
-├── 05_agentic_robot_orchestration.ipynb
-├── requirements.txt
-├── code/
-│   ├── scenarios/
-│   │   ├── base.py
-│   │   ├── pick_place.py
-│   │   ├── __init__.py
-│   │   └── README.md
-│   ├── agentic_pick.py
-│   ├── so100_teacher.py
-│   └── vla_pick.py
-├── scripts/
-│   ├── train.py
-│   ├── args.yaml
-│   └── requirements.txt
-├── container/
-│   ├── Dockerfile
-│   ├── create-image.sh
-│   └── README.md
-├── infrastructure/
-│   └── cloudformation/
-│       ├── workshop.yaml
-│       └── README.md
-├── docs/
-│   └── assets/
-│       └── physical-ai-architecture.gif
-└── datasets/
-    └── so100_sim_pickplace/
-```
-
-Generated datasets, MP4 files, downloaded model weights, checkpoints, and
-temporary `args.yaml` files should not be committed.
-
-## Common Warnings and Failures
-
-### `IProgress not found`
-
-This only changes the notebook progress-bar presentation. Install
-`ipywidgets` if desired.
-
-### TorchCodec cannot load FFmpeg
-
-LeRobot can fall back to PyAV. The fallback is acceptable when:
-
-- `video_backend` is `pyav`;
-- MP4 shards exist;
-- frames decode during training.
-
-### NCCL/OFI warnings on a single GPU
-
-The runtime may fail to initialize the EFA plugin and fall back to NCCL Socket.
-If NCCL reaches `Init COMPLETE`, this warning is not the training failure.
-
-### BF16 AMP unscale failure
-
-```text
-_amp_foreach_non_finite_check_and_unscale_cuda
-not implemented for 'BFloat16'
-```
-
-Set `training.use_amp: false` for the current PyTorch 2.8 SageMaker DLC.
-
-### Inference runs but the task fails
-
-Inspect:
-
-- `placed_in_box`;
-- final cube position;
-- both camera streams;
-- state/action unit conversion;
-- camera mapping;
-- the rollout video.
-
-Model loading is not evidence of learned task success.
-
-## Extending the Workshop
-
-For a new task or dataset:
-
-1. define an observable physical success metric;
-2. keep robot, cameras, units, and action semantics explicit;
-3. implement or teleoperate a teacher that succeeds reliably;
-4. collect enough successful and varied episodes;
-5. validate the finalized dataset artifact;
-6. run a zero-shot baseline;
-7. fine-tune from a pinned checkpoint;
-8. evaluate before and after in fresh, identical scenes;
-9. inspect failures before adding model complexity;
-10. add hardware safety, limits, and supervision before any real-robot run.
-
-## Limitations
-
-- The scripted teacher reads ground-truth MuJoCo object pose. This is privileged
-  simulation supervision, not real-robot perception.
-- Eight episodes validate the pipeline, not generalization.
-- The current trainer is SmolVLA/SO100-specific.
-- The workshop does not implement reinforcement learning, DPO, GRPO, or text
-  SFT.
-- The default evaluation is simulation-only.
-- The agent can retry or stop a policy; it cannot create a grasp skill absent
-  from the checkpoint and demonstrations.
-- Nothing in this repository is a real-robot safety controller.
